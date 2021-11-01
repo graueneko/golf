@@ -181,3 +181,42 @@ func TestParseOSArgs(t *testing.T) {
 		t.Fatalf("Expect d == true, got false")
 	}
 }
+
+func TestStruct(t *testing.T) {
+	Reset()
+	type Config struct {
+		AAA string   `golf:"short:a;long:aaa;default:'string with space'"`
+		BBB int      `golf:"short:b;long:bbb;required;help:'this is \"help\" message for bbb'"`
+		CCC []string `golf:"short:c;long:ccc;help:'this; is; help for \"cc\" or \"ccc\"';required"`
+		DDD []string `golf:"short:d;"`
+	}
+	var conf Config
+	expect := Config{
+		AAA: "string with space",
+		BBB: 290,
+		CCC: []string{
+			"ccc1", "ccc2", "ccc3",
+		},
+		DDD: []string{},
+	}
+
+	args := []string{
+		"--ccc", "ccc1", "--aaa", expect.AAA, "-b", strconv.Itoa(expect.BBB), "-c", "ccc2", "--ccc", "ccc3",
+	}
+	if err := ParseStruct(args, &conf); err != nil {
+		t.Fatal(err)
+	}
+	if conf.AAA != expect.AAA {
+		t.Fatalf("Got %v, want %v", conf.AAA, expect.AAA)
+	}
+	if conf.BBB != 290 {
+		t.Fatalf("Got %d, want %d", conf.BBB, expect.BBB)
+	}
+	if !arrayEqual(conf.CCC, expect.CCC) {
+		t.Fatalf("Got %v, want %v", conf.CCC, expect.CCC)
+	}
+	if !arrayEqual(conf.DDD, expect.DDD) {
+		t.Fatalf("Got %v, want %v", conf.DDD, expect.DDD)
+	}
+	//t.Log(Usage("./golf_test"))
+}

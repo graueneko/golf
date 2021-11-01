@@ -3,6 +3,8 @@ package golf
 import (
 	"fmt"
 	"os"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -14,6 +16,11 @@ type golf struct {
 	longs  map[string]*golfOpt
 	all    []*golfOpt
 }
+
+var (
+	tagPartReg = regexp.MustCompile("(([^;:]+):\\s*'([^']*)'\\s*;?)|(([^:;'\"]+);)|(([^;:]+):([^;]+);?)|([^:;'\"]+)")
+	tagFullReg = regexp.MustCompile("((([^;:]+):\\s*'([^']*)'\\s*;?)|(([^:;'\"]+);)|(([^;:]+):([^;]+);?)|([^:;'\"]+)\\s*)+")
+)
 
 var g golf
 
@@ -33,29 +40,54 @@ const (
 	optBareString
 )
 
-type golfOpt struct {
-	Short    string
-	Long     string
-	Name     string
-	Required bool
-	Default  any
-	Type     optType
-	Result   any
-	IsSet    bool
-	Help     string
+type resultSetter struct {
+	resultPtr *reflect.Value
 }
 
-func (g *golf) addOpt(resultPtr any, short, long, name, help string, defaultVal any, required bool, kind optType) {
+func (p resultSetter) SetValue(v any) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+	p.resultPtr.Set(reflect.ValueOf(v).Convert(p.resultPtr.Type()))
+	return true
+}
+
+func (p resultSetter) AddValue(v any) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+
+	p.resultPtr.Set(reflect.Append(*p.resultPtr, reflect.ValueOf(v)))
+	return true
+}
+
+type golfOpt struct {
+	Short        string
+	Long         string
+	Name         string
+	Required     bool
+	Default      any
+	Type         optType
+	ResultSetter resultSetter
+	IsSet        bool
+	Help         string
+}
+
+func (g *golf) addOpt(rs resultSetter, short, long, name, help string, defaultVal any, required bool, kind optType) {
 	opt := golfOpt{
-		Short:    short,
-		Long:     long,
-		Name:     name,
-		Required: required,
-		Default:  defaultVal,
-		Type:     kind,
-		Result:   resultPtr,
-		IsSet:    false,
-		Help:     help,
+		Short:        short,
+		Long:         long,
+		Name:         name,
+		Required:     required,
+		Default:      defaultVal,
+		Type:         kind,
+		ResultSetter: rs,
+		IsSet:        false,
+		Help:         help,
 	}
 	if short != "" {
 		g.shorts[short] = &opt
@@ -64,6 +96,51 @@ func (g *golf) addOpt(resultPtr any, short, long, name, help string, defaultVal 
 		g.longs[long] = &opt
 	}
 	g.all = append(g.all, &opt)
+}
+
+func (g *golf) addOptTag(rs resultSetter, gtag string) error {
+	if !tagFullReg.MatchString(gtag) {
+		return fmt.Errorf("invalid golf tag format")
+	}
+	t, ok := map[reflect.Kind]optType{
+		reflect.Bool:      optBool,
+		reflect.Int:       optInt,
+		reflect.Float32:   optBool,
+		reflect.Array:     optArray,
+		reflect.Interface: optArray,
+		reflect.Slice:     optArray,
+		reflect.String:    optString,
+	}[rs.resultPtr.Kind()]
+	if !ok {
+		return fmt.Errorf("unsupported type %s", rs.resultPtr.Kind())
+	}
+
+	opt := golfOpt{
+		Short:        "",
+		Long:         "",
+		Name:         "",
+		Required:     false,
+		Default:      nil,
+		Type:         t,
+		ResultSetter: rs,
+		IsSet:        false,
+		Help:         "",
+	}
+	matches := tagPartReg.FindAllStringSubmatch(gtag, -1)
+	for _, m := range matches {
+		if err := opt.fillByTag(m); err != nil {
+			return fmt.Errorf("parse tag [%s] failed: %v", m[0], err)
+		}
+	}
+	if opt.Short != "" {
+		g.shorts[opt.Short] = &opt
+	}
+	if opt.Long != "" {
+		g.longs[opt.Long] = &opt
+	}
+	g.all = append(g.all, &opt)
+
+	return nil
 }
 
 func (o golfOpt) debugArg() string {
@@ -134,65 +211,62 @@ func existInArray(arr []string, val string) bool {
 	return false
 }
 
-func (o *golfOpt) Parse(value string) error {
+func str2bool(value string) (bool, error) {
+	str := strings.ToLower(value)
+	if existInArray([]string{
+		"0", "false", "f", "no", "n",
+	}, str) {
+		return false, nil
+	} else if existInArray([]string{
+		"1", "true", "t", "yes", "y", "",
+	}, str) {
+		return true, nil
+	} else {
+		return false, fmt.Errorf("expect bool, got %s", value)
+	}
+}
+
+func (o *golfOpt) Parse(value string) (err error) {
 	switch o.Type {
 	case optString:
 		fallthrough
 	case optBareString:
-		if ptr, ok := o.Result.(*string); ok {
-			*ptr = value
-		} else {
+		if ok := o.ResultSetter.SetValue(value); !ok {
 			return fmt.Errorf("arg<%s> result ptr is not string", o.debugArg())
 		}
 		break
 	case optInt:
-		if ptr, ok := o.Result.(*int); ok {
-			conv, err := strconv.Atoi(value)
-			if err != nil {
-				return fmt.Errorf("arg<%s> require int, got <%s>", o.debugArg(), value)
-			}
-			*ptr = conv
-		} else {
+		conv, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("arg<%s> require int, got <%s>", o.debugArg(), value)
+		}
+		if ok := o.ResultSetter.SetValue(conv); !ok {
 			return fmt.Errorf("arg<%s> result ptr is not int", o.debugArg())
 		}
 		break
 	case optBool:
-		if ptr, ok := o.Result.(*bool); ok {
-			if strings.HasPrefix(value, "-") {
-				*ptr = true
-			} else {
-				str := strings.ToLower(value)
-				if existInArray([]string{
-					"0", "false", "f", "no", "n",
-				}, str) {
-					*ptr = false
-				} else if existInArray([]string{
-					"1", "true", "t", "yes", "y", "",
-				}, str) {
-					*ptr = true
-				} else {
-					return fmt.Errorf("arg<%s> expect bool, got %s", o.debugArg(), value)
-				}
-			}
-		} else {
+		result := false
+		if strings.HasPrefix(value, "-") {
+			result = true
+		} else if result, err = str2bool(value); err != nil {
+			return fmt.Errorf("arg<%s> %v", o.debugArg(), err.Error())
+		}
+		if ok := o.ResultSetter.SetValue(result); !ok {
 			return fmt.Errorf("arg<%s> result ptr is not bool", o.debugArg())
 		}
 		break
 	case optFloat:
-		if ptr, ok := o.Result.(*float64); ok {
-			f, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				return fmt.Errorf("arg<%s> require float64, got <%s>", o.debugArg(), value)
-			}
-			*ptr = f
-		} else {
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("arg<%s> require float64, got <%s>", o.debugArg(), value)
+		}
+
+		if ok := o.ResultSetter.SetValue(f); !ok {
 			return fmt.Errorf("arg<%s> result ptr is not float", o.debugArg())
 		}
 		break
 	case optArray:
-		if ptr, ok := o.Result.(*[]string); ok {
-			*ptr = append(*ptr, value)
-		} else {
+		if ok := o.ResultSetter.AddValue(value); !ok {
 			return fmt.Errorf("arg<%s> result ptr is not []string", o.debugArg())
 		}
 	default:
@@ -200,6 +274,112 @@ func (o *golfOpt) Parse(value string) error {
 	}
 	o.IsSet = true
 	return nil
+}
+
+func (o *golfOpt) fillByTag(m []string) error {
+	if len(m) != 10 {
+		return fmt.Errorf("invalid length %d", len(m))
+	}
+	key := ""
+	val := ""
+	if m[2] != "" {
+		// <key>: '<value>'[;]
+		// value in quote
+		key = strings.TrimSpace(m[2])
+		val = m[3]
+	} else if m[5] != "" {
+		// <key>;
+		// key only, value empty
+		key = strings.TrimSpace(m[5])
+	} else if m[7] != "" {
+		// <key>: <value>[;]
+		// key and value, without quote
+		key = strings.TrimSpace(m[7])
+		val = strings.TrimSpace(m[8])
+	} else if m[9] != "" {
+		// <key>
+		// key without value and colon
+		key = strings.TrimSpace(m[9])
+	}
+
+	switch strings.ToLower(key) {
+	case "s":
+		fallthrough
+	case "short":
+		if val == "" {
+			return fmt.Errorf("<short> cannot be empty")
+		}
+		o.Short = val
+		break
+	case "l":
+		fallthrough
+	case "long":
+		if val == "" {
+			return fmt.Errorf("<long> cannot be empty")
+		}
+		o.Long = val
+		break
+	case "n":
+		fallthrough
+	case "name":
+		if val == "" {
+			return fmt.Errorf("<name> cannot be empty")
+		}
+		o.Name = val
+		break
+	case "d":
+		fallthrough
+	case "default":
+		defaultVal, err := str2optType(o.Type, val)
+		if err != nil {
+			return fmt.Errorf("invalid <default> val: %s", val)
+		}
+		o.Default = defaultVal
+		break
+	case "h":
+		fallthrough
+	case "help":
+		o.Help = val
+		break
+	case "r":
+		fallthrough
+	case "required":
+		req, err := str2bool(val)
+		if err != nil {
+			return fmt.Errorf("invalid <required> val: %s", val)
+		}
+		o.Required = req
+	default:
+		return fmt.Errorf("invalid tag option <%s>", key)
+	}
+	return nil
+}
+
+func str2optType(t optType, s string) (any, error) {
+	switch t {
+	case optInt:
+		if i, err := strconv.Atoi(s); err != nil {
+			return nil, fmt.Errorf("<%s> not valid int", s)
+		} else {
+			return i, nil
+		}
+	case optBool:
+		if b, err := str2bool(s); err != nil {
+			return false, err
+		} else {
+			return b, nil
+		}
+	case optString:
+		return s, nil
+	case optFloat:
+		if f, err := strconv.ParseFloat(s, 64); err != nil {
+			return nil, fmt.Errorf("<%s> not valid float", s)
+		} else {
+			return f, nil
+		}
+	default:
+		return nil, fmt.Errorf("cannot parse type %v from string", t)
+	}
 }
 
 func parseKV(k, v string) error {
@@ -225,54 +405,72 @@ func parseKV(k, v string) error {
 
 func String(short, long, name, help string, defaultVal string) *string {
 	result := defaultVal
-	g.addOpt(&result, short, long, name, help, defaultVal, false, optString)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, short, long, name, help, defaultVal, false, optString)
 	return &result
 }
 
 func MustString(short, long, name, help string) *string {
 	result := ""
-	g.addOpt(&result, short, long, name, help, "", true, optString)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, short, long, name, help, "", true, optString)
 	return &result
 }
 
 func Int(short, long, name, help string, defaultVal int) *int {
 	result := defaultVal
-	g.addOpt(&result, short, long, name, help, result, false, optInt)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, short, long, name, help, result, false, optInt)
 	return &result
 }
 
 func MustInt(short, long, name, help string) *int {
 	result := 0
-	g.addOpt(&result, short, long, name, help, result, true, optInt)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, short, long, name, help, result, true, optInt)
 	return &result
 }
 
 func Bool(short, long, name, help string, defaultVal bool) *bool {
 	result := defaultVal
-	g.addOpt(&result, short, long, name, help, result, false, optBool)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, short, long, name, help, result, false, optBool)
 	return &result
 }
 
 func MustBool(short, long, name, help string) *bool {
 	result := false
-	g.addOpt(&result, short, long, name, help, false, true, optBool)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, short, long, name, help, false, true, optBool)
 	return &result
 }
 
 func Array(short, long, name, help string) *[]string {
 	result := make([]string, 0)
-	g.addOpt(&result, short, long, name, help, result, false, optArray)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, short, long, name, help, result, false, optArray)
 	return &result
 }
 
 func BareArray(name, help string) *[]string {
 	result := make([]string, 0)
-	g.addOpt(&result, "", "", name, help, result, false, optBareArray)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, "", "", name, help, result, false, optBareArray)
 	return &result
 }
 func BareString(name, help string) *string {
 	result := ""
-	g.addOpt(&result, "", "", name, help, result, true, optBareString)
+	resultValue := reflect.ValueOf(&result).Elem()
+	setter := resultSetter{resultPtr: &resultValue}
+	g.addOpt(setter, "", "", name, help, result, true, optBareString)
 	return &result
 }
 
@@ -304,7 +502,12 @@ func Usage(executable string) string {
 	return builder.String()
 }
 
-func Parse(args []string) error {
+func Parse(args []string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("golf parse panic: %v", reflect.TypeOf(r).Elem().Name())
+		}
+	}()
 	bares := make([]string, 0)
 	key := ""
 	for _, entry := range args {
@@ -350,11 +553,9 @@ func Parse(args []string) error {
 	}
 	for _, opt := range g.all {
 		if opt.Type == optBareArray {
-			result, ok := opt.Result.(*[]string)
-			if !ok {
+			if ok := opt.ResultSetter.SetValue(bares); !ok {
 				return fmt.Errorf("arg<%s> result ptr is not []string", opt.debugArg())
 			}
-			*result = bares
 			opt.IsSet = true
 			bares = make([]string, 0)
 		}
@@ -367,6 +568,35 @@ func Parse(args []string) error {
 	}
 
 	return nil
+}
+
+func ParseStruct(args []string, v interface{}) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("parse struct panic: %s", reflect.TypeOf(r).Elem().Name())
+		}
+	}()
+	vpt := reflect.ValueOf(v)
+	if vpt.Kind() != reflect.Ptr {
+		return fmt.Errorf("parse struct expects pointer to struct")
+	}
+	vt := vpt.Elem().Type()
+	vv := vpt.Elem()
+	for i := 0; i < vt.NumField(); i++ {
+		st := vt.Field(i)
+		gtag := st.Tag.Get("golf")
+		if gtag == "" {
+			continue
+		}
+		sv := vv.Field(i)
+		setter := resultSetter{resultPtr: &sv}
+
+		if err := g.addOptTag(setter, gtag); err != nil {
+			return fmt.Errorf("golf parse tag of [%s] failed: %v", st.Name, err)
+		}
+	}
+
+	return Parse(args)
 }
 
 func ParseOSArgs() (bool, error) {
