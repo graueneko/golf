@@ -189,6 +189,7 @@ func TestStruct(t *testing.T) {
 		BBB int      `golf:"short:b;long:bbb;required;help:'this is \"help\" message for bbb'"`
 		CCC []string `golf:"short:c;long:ccc;help:'this; is; help for \"cc\" or \"ccc\"';required"`
 		DDD []string `golf:"short:d;"`
+		EEE string   `golf:""`
 	}
 	var conf Config
 	expect := Config{
@@ -218,5 +219,5 @@ func TestStruct(t *testing.T) {
 	if !arrayEqual(conf.DDD, expect.DDD) {
 		t.Fatalf("Got %v, want %v", conf.DDD, expect.DDD)
 	}
-	//t.Log(Usage("./golf_test"))
+	t.Log(Usage("./golf_test"))
 }

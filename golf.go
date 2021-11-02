@@ -20,6 +20,9 @@ type golf struct {
 var (
 	tagPartReg = regexp.MustCompile("(([^;:]+):\\s*'([^']*)'\\s*;?)|(([^:;'\"]+);)|(([^;:]+):([^;]+);?)|([^:;'\"]+)")
 	tagFullReg = regexp.MustCompile("((([^;:]+):\\s*'([^']*)'\\s*;?)|(([^:;'\"]+);)|(([^;:]+):([^;]+);?)|([^:;'\"]+)\\s*)+")
+
+	nameFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
+	nameAllCap   = regexp.MustCompile("([a-z0-9])([A-Z])")
 )
 
 var g golf
@@ -120,7 +123,7 @@ func (g *golf) addOptTag(rs resultSetter, gtag string) error {
 		Long:         "",
 		Name:         "",
 		Required:     false,
-		Default:      nil,
+		Default:      defaultValOfType(t),
 		Type:         t,
 		ResultSetter: rs,
 		IsSet:        false,
@@ -382,6 +385,26 @@ func str2optType(t optType, s string) (any, error) {
 	}
 }
 
+func defaultValOfType(t optType) any {
+	switch t {
+	case optInt:
+		return 0
+	case optBool:
+		return false
+	case optBareString:
+		fallthrough
+	case optString:
+		return ""
+	case optFloat:
+		return 0.0
+	case optBareArray:
+		fallthrough
+	case optArray:
+		return make([]string, 0)
+	}
+	return nil
+}
+
 func parseKV(k, v string) error {
 	if strings.HasPrefix(k, "--") {
 		key := strings.TrimPrefix(k, "--")
@@ -573,22 +596,30 @@ func Parse(args []string) (err error) {
 func ParseStruct(args []string, v interface{}) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("parse struct panic: %s", reflect.TypeOf(r).Elem().Name())
+			err = fmt.Errorf("golf parse struct panic: %s", reflect.TypeOf(r).Elem().Name())
 		}
 	}()
 	vpt := reflect.ValueOf(v)
 	if vpt.Kind() != reflect.Ptr {
-		return fmt.Errorf("parse struct expects pointer to struct")
+		return fmt.Errorf("golf parse struct expects a pointer to struct")
 	}
 	vt := vpt.Elem().Type()
 	vv := vpt.Elem()
 	for i := 0; i < vt.NumField(); i++ {
 		st := vt.Field(i)
-		gtag := st.Tag.Get("golf")
-		if gtag == "" {
+		sv := vv.Field(i)
+		if !sv.CanSet() {
 			continue
 		}
-		sv := vv.Field(i)
+		gtag, ok := st.Tag.Lookup("golf")
+		if !ok {
+			continue
+		}
+		if gtag == "" {
+			snake := nameFirstCap.ReplaceAllString(st.Name, "${1}_${2}")
+			snake = strings.ToLower(nameAllCap.ReplaceAllString(snake, "${1}_${2}"))
+			gtag = fmt.Sprintf("l:%s;n:%s", snake, st.Name)
+		}
 		setter := resultSetter{resultPtr: &sv}
 
 		if err := g.addOptTag(setter, gtag); err != nil {
